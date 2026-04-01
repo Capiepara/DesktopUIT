@@ -1,0 +1,622 @@
+import pandas as pd
+import numpy as np
+from collections import Counter
+from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
+
+STAGES = ['LR2', 'FLC', 'SMS', 'CFM']
+
+
+def process_excel_data(input_file, output_file):
+    """
+    Đọc file rawdata_colorway.xlsx, phân tích sequence stage thực tế của từng colorway
+    theo thứ tự LR2 -> FLC -> SMS -> CFM, không fix cứng phải đủ 4 stage.
+
+    Nếu sequence dừng sớm:
+    - stage cuối cùng đang đạt tới sẽ là DROP ở stage đó
+    - các stage trước đó là ONGOING
+
+    Đồng thời vẫn xuất ra các sheet:
+    - Detailed Analysis
+    - colorway Classification
+    - colorway Detail
+    - colorway Adoption Breakdown
+    - Summary
+    """
+    xls = pd.ExcelFile(input_file)
+    df = pd.read_excel(xls, sheet_name='Sheet1')
+    df.replace('', pd.NA, inplace=True)
+
+    has_dev_code = 'Development code' in df.columns
+    mode = "model" if not has_dev_code else "legacy"
+    print(f"🔍 Phát hiện chế độ: {'Model (dùng Gender_Model)' if mode=='model' else 'Legacy (dùng Development code)'}")
+
+    # Đảm bảo cột stage luôn tồn tại
+    for s in STAGES:
+        if s not in df.columns:
+            df[s] = pd.NA
+
+    # Đảm bảo luôn có Gender_Model để dùng cho colorway Detail
+    if 'Gender_Model' not in df.columns:
+        df['Gender_Model'] = pd.NA
+
+    # Flag stage
+    for s in STAGES:
+        df[f'Has_{s}'] = df[s].notna()
+
+    # Mapping Model_Code -> Gender_Model nếu có Development code
+    model_to_gender = {}
+    if has_dev_code:
+        df['Model_Code'] = df['Development code'].apply(
+            lambda x: str(x).split('-')[0] if pd.notna(x) and '-' in str(x) else x
+        )
+        for _, r in df.iterrows():
+            if pd.notna(r.get('Model_Code')) and pd.notna(r.get('Gender_Model')):
+                model_to_gender[str(r['Model_Code'])] = str(r['Gender_Model'])
+
+    # =========================
+    # HELPER
+    # =========================
+    def get_present_stages(row):
+        return [s for s in STAGES if bool(row.get(f'Has_{s}', False))]
+
+    def get_origin_stage(present_stages):
+        return present_stages[0] if present_stages else None
+
+    def get_last_stage(present_stages):
+        return present_stages[-1] if present_stages else None
+
+    def classify_path_from_stages(present_stages):
+        if not present_stages:
+            return 'Unknown'
+        return '_'.join(present_stages)
+
+    def has_stage_after(present_stages, stage):
+        if stage not in present_stages:
+            return False
+        idx = STAGES.index(stage)
+        return any(s in present_stages for s in STAGES[idx + 1:])
+
+    df['Present_Stages'] = df.apply(get_present_stages, axis=1)
+    df['Origin_Stage'] = df['Present_Stages'].apply(get_origin_stage)
+    df['Last_Stage'] = df['Present_Stages'].apply(get_last_stage)
+    df['Path'] = df['Present_Stages'].apply(classify_path_from_stages)
+
+    print("\n📊 THỐNG KÊ PATH:")
+    print(df['Path'].value_counts(dropna=False))
+    print(f"\n📌 Total rows raw data: {len(df)}")
+
+    # ==========================
+    # 1) Detailed Analysis
+    # ==========================
+    group_keys = ['Factory', 'Material Indicator']
+    detail_calc_rows = []
+
+    grouped = df.groupby(group_keys, dropna=False)
+    for (factory, material), g in grouped:
+        row_out = {
+            'Factory': factory,
+            'Material': material,
+            'Total colorway': len(g)
+        }
+
+        # Stage Count / Ongoing / Drop
+        for stage in STAGES:
+            stage_present_mask = g[f'Has_{stage}'] == True
+            stage_count = int(stage_present_mask.sum())
+
+            stage_ongoing = 0
+            stage_drop = 0
+            for _, r in g[stage_present_mask].iterrows():
+                pstages = r['Present_Stages']
+                if has_stage_after(pstages, stage):
+                    stage_ongoing += 1
+                else:
+                    # Nếu là stage cuối cùng của pipeline thì không coi là drop
+                    if stage != STAGES[-1]:
+                        stage_drop += 1
+
+            row_out[f'{stage} Count'] = stage_count
+            row_out[f'{stage} Count_Ongoing'] = stage_ongoing
+            row_out[f'{stage} Count_Drop'] = stage_drop
+
+        # LR2 New
+        row_out['LR2 New'] = int((g['Has_LR2'] == True).sum())
+
+        # FLC origin split
+        row_out['FLC Ongoing from LR2'] = int(((g['Has_FLC']) & (g['Has_LR2'])).sum())
+        row_out['FLC New'] = int(((g['Has_FLC']) & (~g['Has_LR2'])).sum())
+
+        # SMS origin split
+        row_out['SMS Ongoing from Both'] = int(((g['Has_SMS']) & (g['Has_LR2']) & (g['Has_FLC'])).sum())
+        row_out['SMS Ongoing from FLC Only'] = int(((g['Has_SMS']) & (~g['Has_LR2']) & (g['Has_FLC'])).sum())
+        row_out['SMS New'] = int(((g['Has_SMS']) & (~g['Has_LR2']) & (~g['Has_FLC'])).sum())
+
+        # CFM origin split
+        row_out['CFM Ongoing from LR2'] = int(((g['Has_CFM']) & (g['Has_LR2'])).sum())
+        row_out['CFM Ongoing from FLC'] = int(((g['Has_CFM']) & (~g['Has_LR2']) & (g['Has_FLC'])).sum())
+        row_out['CFM Ongoing from SMS'] = int(((g['Has_CFM']) & (~g['Has_LR2']) & (~g['Has_FLC']) & (g['Has_SMS'])).sum())
+        row_out['CFM New'] = int(((g['Has_CFM']) & (~g['Has_LR2']) & (~g['Has_FLC']) & (~g['Has_SMS'])).sum())
+
+        # Drop transition metrics
+        row_out['Drop LR2 in FLC'] = int(((g['Origin_Stage'] == 'LR2') & (~g['Has_FLC'])).sum())
+        row_out['Drop LR2 in SMS'] = int(((g['Origin_Stage'] == 'LR2') & (g['Has_FLC']) & (~g['Has_SMS'])).sum())
+        row_out['Drop LR2 in CFM'] = int(((g['Origin_Stage'] == 'LR2') & (g['Has_SMS']) & (~g['Has_CFM'])).sum())
+
+        row_out['Drop FLC in SMS'] = int(((g['Origin_Stage'] == 'FLC') & (~g['Has_SMS'])).sum())
+        row_out['Drop FLC in CFM'] = int(((g['Origin_Stage'] == 'FLC') & (g['Has_SMS']) & (~g['Has_CFM'])).sum())
+
+        row_out['Drop SMS in CFM'] = int(((g['Origin_Stage'] == 'SMS') & (~g['Has_CFM'])).sum())
+
+        row_out['Total Drop'] = (
+            row_out['LR2 Count_Drop'] +
+            row_out['FLC Count_Drop'] +
+            row_out['SMS Count_Drop']
+        )
+
+        detail_calc_rows.append(row_out)
+
+    detailed_analysis = pd.DataFrame(detail_calc_rows)
+
+    detailed_cols = [
+        'Factory', 'Material', 'Total colorway',
+        'LR2 Count', 'LR2 Count_Ongoing', 'LR2 Count_Drop', 'LR2 New',
+        'FLC Count', 'FLC Count_Ongoing', 'FLC Count_Drop',
+        'SMS Count', 'SMS Count_Ongoing', 'SMS Count_Drop',
+        'CFM Count', 'CFM Count_Ongoing', 'CFM Count_Drop',
+        'FLC Ongoing from LR2', 'FLC New',
+        'SMS Ongoing from Both', 'SMS Ongoing from FLC Only', 'SMS New',
+        'CFM Ongoing from LR2', 'CFM Ongoing from FLC', 'CFM Ongoing from SMS', 'CFM New',
+        'Drop LR2 in FLC', 'Drop LR2 in SMS', 'Drop LR2 in CFM',
+        'Drop FLC in SMS', 'Drop FLC in CFM',
+        'Drop SMS in CFM',
+        'Total Drop'
+    ]
+    for c in detailed_cols:
+        if c not in detailed_analysis.columns:
+            detailed_analysis[c] = 0
+    detailed_analysis = detailed_analysis[detailed_cols].copy()
+
+    print(f"📌 Total counted in Detailed Analysis: {int(detailed_analysis['Total colorway'].sum())}")
+    print(f"📌 Unknown rows: {(df['Path'] == 'Unknown').sum()}")
+
+    # ==========================
+    # 2) colorway Classification
+    # ==========================
+    classification_data = []
+    for _, r in df.iterrows():
+        row = {
+            'Factory': r['Factory'],
+            'Material Indicator': r['Material Indicator'],
+            'LR2': 'Yes' if r['Has_LR2'] else 'No',
+            'FLC': 'Yes' if r['Has_FLC'] else 'No',
+            'SMS': 'Yes' if r['Has_SMS'] else 'No',
+            'CFM': 'Yes' if r['Has_CFM'] else 'No',
+            'Path': r['Path'],
+            'Origin Stage': r['Origin_Stage'],
+            'Last Stage': r['Last_Stage'],
+        }
+        if has_dev_code:
+            row['Development code'] = r['Development code']
+        else:
+            row['Gender_Model'] = r['Gender_Model']
+        classification_data.append(row)
+
+    colorway_classification = pd.DataFrame(classification_data)
+
+    # ==========================
+    # 3) colorway Detail (LISTS)
+    # ==========================
+    def format_gender_model_list(model_names):
+        if model_names is None or (isinstance(model_names, float) and pd.isna(model_names)):
+            return ""
+        if not model_names:
+            return ""
+
+        cleaned = []
+        for x in model_names:
+            if pd.notna(x):
+                s = str(x).strip()
+                if s:
+                    cleaned.append(s)
+
+        if not cleaned:
+            return ""
+
+        counter = Counter(cleaned)
+        return ", ".join([f"{model} ({count})" for model, count in counter.items()])
+
+    def combine(*args):
+        non_empty = [str(s).strip() for s in args if s and str(s).strip()]
+        return ", ".join(non_empty)
+
+    # Luôn dùng Gender_Model cho colorway Detail
+    group_col = 'Gender_Model'
+
+    detail_rows = []
+    for (factory, material), g in grouped:
+        def collect(mask):
+            vals = g.loc[mask, group_col].tolist() if group_col in g.columns else []
+            return format_gender_model_list(vals)
+
+        lr2_all = collect(g['Has_LR2'])
+        flc_all = collect(g['Has_FLC'])
+        sms_all = collect(g['Has_SMS'])
+        cfm_all = collect(g['Has_CFM'])
+
+        lr2_ongoing = collect(g['Has_LR2'] & (g['Last_Stage'] != 'LR2'))
+        lr2_drop = collect(g['Has_LR2'] & (g['Last_Stage'] == 'LR2'))
+
+        flc_ongoing = collect(g['Has_FLC'] & (g['Last_Stage'].isin(['SMS', 'CFM'])))
+        flc_drop = collect(g['Has_FLC'] & (g['Last_Stage'] == 'FLC'))
+
+        sms_ongoing = collect(g['Has_SMS'] & (g['Has_CFM']))
+        sms_drop = collect(g['Has_SMS'] & (~g['Has_CFM']))
+
+        cfm_ongoing = collect(g['Has_CFM'])
+        cfm_drop = ""
+
+        flc_ongoing_from_lr2 = collect(g['Has_FLC'] & g['Has_LR2'])
+        flc_new = collect(g['Has_FLC'] & (~g['Has_LR2']))
+
+        sms_ongoing_from_both = collect(g['Has_SMS'] & g['Has_LR2'] & g['Has_FLC'])
+        sms_ongoing_from_flc_only = collect(g['Has_SMS'] & (~g['Has_LR2']) & g['Has_FLC'])
+        sms_new = collect(g['Has_SMS'] & (~g['Has_LR2']) & (~g['Has_FLC']))
+
+        cfm_ongoing_from_lr2 = collect(g['Has_CFM'] & g['Has_LR2'])
+        cfm_ongoing_from_flc = collect(g['Has_CFM'] & (~g['Has_LR2']) & g['Has_FLC'])
+        cfm_ongoing_from_sms = collect(g['Has_CFM'] & (~g['Has_LR2']) & (~g['Has_FLC']) & g['Has_SMS'])
+        cfm_new = collect(g['Has_CFM'] & (~g['Has_LR2']) & (~g['Has_FLC']) & (~g['Has_SMS']))
+
+        drop_lr2_in_flc = collect((g['Origin_Stage'] == 'LR2') & (~g['Has_FLC']))
+        drop_lr2_in_sms = collect((g['Origin_Stage'] == 'LR2') & g['Has_FLC'] & (~g['Has_SMS']))
+        drop_lr2_in_cfm = collect((g['Origin_Stage'] == 'LR2') & g['Has_SMS'] & (~g['Has_CFM']))
+
+        drop_flc_in_sms = collect((g['Origin_Stage'] == 'FLC') & (~g['Has_SMS']))
+        drop_flc_in_cfm = collect((g['Origin_Stage'] == 'FLC') & g['Has_SMS'] & (~g['Has_CFM']))
+        drop_sms_in_cfm = collect((g['Origin_Stage'] == 'SMS') & (~g['Has_CFM']))
+
+        total_colorway = collect(pd.Series([True] * len(g), index=g.index))
+        total_drop = combine(lr2_drop, flc_drop, sms_drop)
+
+        flc_seg_ongoing_lr2 = collect(g['Has_FLC'] & g['Has_LR2'] & g['Has_SMS'])
+        flc_seg_ongoing_new = collect(g['Has_FLC'] & (~g['Has_LR2']) & (g['Has_SMS'] | g['Has_CFM']))
+
+        detail_rows.append({
+            'Factory': factory,
+            'Material': material,
+
+            'Total_colorway': total_colorway,
+
+            'LR2': lr2_all,
+            'LR2_Ongoing': lr2_ongoing,
+            'LR2_Drop': lr2_drop,
+
+            'FLC': flc_all,
+            'FLC_Ongoing': flc_ongoing,
+            'FLC_Drop': flc_drop,
+
+            'SMS': sms_all,
+            'SMS_Ongoing': sms_ongoing,
+            'SMS_Drop': sms_drop,
+
+            'CFM': cfm_all,
+            'CFM_Ongoing': cfm_ongoing,
+            'CFM_Drop': cfm_drop,
+
+            'FLC_Ongoing_LR2': flc_ongoing_from_lr2,
+            'FLC_New': flc_new,
+
+            'SMS_Ongoing_Both': sms_ongoing_from_both,
+            'SMS_Ongoing_FLC': sms_ongoing_from_flc_only,
+            'SMS_New': sms_new,
+
+            'CFM_Ongoing_All': cfm_ongoing_from_lr2,
+            'CFM_Ongoing_FLC': cfm_ongoing_from_flc,
+            'CFM_Ongoing_SMS': cfm_ongoing_from_sms,
+            'CFM_New': cfm_new,
+
+            'Drop_LR2_in_FLC': drop_lr2_in_flc,
+            'Drop_LR2_in_SMS': drop_lr2_in_sms,
+            'Drop_LR2_in_CFM': drop_lr2_in_cfm,
+            'Drop_FLC_in_SMS': drop_flc_in_sms,
+            'Drop_FLC_in_CFM': drop_flc_in_cfm,
+            'Drop_SMS_in_CFM': drop_sms_in_cfm,
+
+            'Total_Drop': total_drop,
+
+            'FLC_seg_ongoing_lr2': flc_seg_ongoing_lr2,
+            'FLC_seg_ongoing_new': flc_seg_ongoing_new,
+        })
+
+    colorway_detail = pd.DataFrame(detail_rows)
+
+    detail_columns_order = [
+        'Factory', 'Material',
+        'Total_colorway',
+        'LR2', 'LR2_Ongoing', 'LR2_Drop',
+        'FLC', 'FLC_Ongoing', 'FLC_Drop',
+        'SMS', 'SMS_Ongoing', 'SMS_Drop',
+        'CFM', 'CFM_Ongoing', 'CFM_Drop',
+        'FLC_Ongoing_LR2', 'FLC_New',
+        'SMS_Ongoing_Both', 'SMS_Ongoing_FLC', 'SMS_New',
+        'CFM_Ongoing_All', 'CFM_Ongoing_FLC', 'CFM_Ongoing_SMS', 'CFM_New',
+        'Drop_LR2_in_FLC', 'Drop_LR2_in_SMS', 'Drop_LR2_in_CFM',
+        'Drop_FLC_in_SMS', 'Drop_FLC_in_CFM',
+        'Drop_SMS_in_CFM',
+        'Total_Drop',
+        'FLC_seg_ongoing_lr2',
+        'FLC_seg_ongoing_new',
+    ]
+    for c in detail_columns_order:
+        if c not in colorway_detail.columns:
+            colorway_detail[c] = ""
+    colorway_detail = colorway_detail[detail_columns_order]
+
+    # ==========================
+    # WRITE EXCEL
+    # ==========================
+    with pd.ExcelWriter(output_file, engine='openpyxl') as writer:
+        detailed_analysis.to_excel(writer, sheet_name='Detailed Analysis', index=False)
+        colorway_classification.to_excel(writer, sheet_name='colorway Classification', index=False)
+        colorway_detail.to_excel(writer, sheet_name='colorway Detail', index=False)
+
+        wb = writer.book
+        ws = wb.create_sheet('colorway Adoption Breakdown')
+        format_breakdown_sheet(ws, detailed_analysis)
+        add_summary_sheet(wb, detailed_analysis)
+
+        format_colorway_classification_sheet(wb['colorway Classification'], colorway_classification, has_dev_code)
+        format_colorway_detail_sheet(wb['colorway Detail'], colorway_detail)
+
+    print(f"\n✅ Xử lý hoàn tất. File đầu ra: {output_file}")
+
+
+# ===================== FORMAT EXCEL =====================
+def add_summary_sheet(workbook, detailed_analysis):
+    total_cw = int(detailed_analysis['Total colorway'].sum())
+    total_drop = int(detailed_analysis['Total Drop'].sum())
+    total_active = total_cw - total_drop
+
+    ws = workbook.create_sheet('Summary')
+    header_fill = PatternFill(start_color="E0E0E0", end_color="E0E0E0", fill_type="solid")
+    bold = Font(bold=True)
+    center = Alignment(horizontal="center")
+    border = Border(left=Side(style='thin'), right=Side(style='thin'),
+                    top=Side(style='thin'), bottom=Side(style='thin'))
+
+    headers = ["TOTAL COLORWAY", "TOTAL COLORWAY DROPPED", "TOTAL COLORWAY ACTIVE"]
+    for col, h in enumerate(headers, 1):
+        cell = ws.cell(row=1, column=col, value=h)
+        cell.fill = header_fill
+        cell.font = bold
+        cell.alignment = center
+        cell.border = border
+
+    values = [total_cw, total_drop, total_active]
+    for col, v in enumerate(values, 1):
+        cell = ws.cell(row=2, column=col, value=v)
+        cell.alignment = center
+        cell.border = border
+
+    if total_cw > 0:
+        pct_drop = (total_drop / total_cw) * 100
+        pct_active = (total_active / total_cw) * 100
+    else:
+        pct_drop = pct_active = 0
+    pcts = [100.0, pct_drop, pct_active]
+    for col, p in enumerate(pcts, 1):
+        cell = ws.cell(row=3, column=col, value=f"{p:.0f}%")
+        cell.alignment = center
+        cell.border = border
+
+    for col in range(1, 4):
+        ws.column_dimensions[get_column_letter(col)].width = 22
+
+    cfm_total = detailed_analysis['CFM Count'].sum()
+    lr2_cfm = detailed_analysis['CFM Ongoing from LR2'].sum()
+    flc_cfm = detailed_analysis['CFM Ongoing from FLC'].sum()
+    sms_cfm = detailed_analysis['CFM Ongoing from SMS'].sum()
+    cfm_new = detailed_analysis['CFM New'].sum()
+
+    start_row = 5
+    ws.cell(row=start_row, column=1, value="THỐNG KÊ PRODUCTION (CFM = YES) THEO NGUỒN GỐC").font = Font(bold=True, size=12)
+    start_row += 1
+
+    headers1 = ["Nguồn gốc", "Số lượng", "Tỷ lệ %"]
+    for col, h in enumerate(headers1, 1):
+        cell = ws.cell(row=start_row, column=col, value=h)
+        cell.fill = header_fill
+        cell.font = bold
+        cell.border = border
+        cell.alignment = center
+
+    data1 = [
+        ("From LR2", int(lr2_cfm), (lr2_cfm / cfm_total * 100) if cfm_total else 0),
+        ("From FLC", int(flc_cfm), (flc_cfm / cfm_total * 100) if cfm_total else 0),
+        ("From SMS", int(sms_cfm), (sms_cfm / cfm_total * 100) if cfm_total else 0),
+        ("New at CFM", int(cfm_new), (cfm_new / cfm_total * 100) if cfm_total else 0),
+    ]
+
+    for i, (path, count, pct) in enumerate(data1, start_row + 1):
+        ws.cell(row=i, column=1, value=path).border = border
+        ws.cell(row=i, column=2, value=count).border = border
+        pct_cell = ws.cell(row=i, column=3, value=f"{pct:.1f}%")
+        pct_cell.border = border
+        pct_cell.alignment = center
+
+    sum_lr2 = detailed_analysis['LR2 Count'].sum()
+    sum_lr2_drop = detailed_analysis['LR2 Count_Drop'].sum()
+    sum_flc_total = detailed_analysis['FLC Count'].sum()
+    sum_flc_drop = detailed_analysis['FLC Count_Drop'].sum()
+    sum_sms_total = detailed_analysis['SMS Count'].sum()
+    sum_sms_drop = detailed_analysis['SMS Count_Drop'].sum()
+    sum_cfm_total = detailed_analysis['CFM Count'].sum()
+    sum_cfm_drop = detailed_analysis['CFM Count_Drop'].sum()
+
+    start_row2 = start_row + len(data1) + 3
+    ws.cell(row=start_row2, column=1, value="THỐNG KÊ SỐ LƯỢNG COLORWAY VÀ DROP THEO GIAI ĐOẠN").font = Font(bold=True, size=12)
+    start_row2 += 1
+
+    headers2 = ["Giai đoạn", "Tổng số colorway", "Số lượng drop", "Tỷ lệ drop %"]
+    for col, h in enumerate(headers2, 1):
+        cell = ws.cell(row=start_row2, column=col, value=h)
+        cell.fill = header_fill
+        cell.font = bold
+        cell.border = border
+        cell.alignment = center
+
+    data2 = [
+        ("LR2", int(sum_lr2), int(sum_lr2_drop), (sum_lr2_drop / sum_lr2 * 100) if sum_lr2 else 0),
+        ("FLC", int(sum_flc_total), int(sum_flc_drop), (sum_flc_drop / sum_flc_total * 100) if sum_flc_total else 0),
+        ("SMS", int(sum_sms_total), int(sum_sms_drop), (sum_sms_drop / sum_sms_total * 100) if sum_sms_total else 0),
+        ("CFM", int(sum_cfm_total), int(sum_cfm_drop), (sum_cfm_drop / sum_cfm_total * 100) if sum_cfm_total else 0)
+    ]
+
+    for i, (stage, total, drop, pct) in enumerate(data2, start_row2 + 1):
+        ws.cell(row=i, column=1, value=stage).border = border
+        ws.cell(row=i, column=2, value=total).border = border
+        ws.cell(row=i, column=3, value=drop).border = border
+        pct_cell = ws.cell(row=i, column=4, value=f"{pct:.1f}%")
+        pct_cell.border = border
+        pct_cell.alignment = center
+
+    for col in range(1, 5):
+        ws.column_dimensions[get_column_letter(col)].width = 22
+
+
+def format_breakdown_sheet(worksheet, data):
+    header_fill = PatternFill(start_color="E0E0E0", end_color="E0E0E0", fill_type="solid")
+    bold = Font(bold=True)
+    center = Alignment(horizontal="center")
+    thin_border = Border(left=Side(style='thin'), right=Side(style='thin'),
+                         top=Side(style='thin'), bottom=Side(style='thin'))
+
+    num_cols = len(data.columns)
+    worksheet.merge_cells(f'A1:{get_column_letter(num_cols)}1')
+    worksheet['A1'] = "FW26 ADOPTION - DETAILED BREAKDOWN"
+    worksheet['A1'].font = Font(bold=True, size=14)
+    worksheet['A1'].alignment = center
+
+    for col_idx, col_name in enumerate(data.columns, 1):
+        cell = worksheet.cell(row=3, column=col_idx, value=col_name)
+        cell.fill = header_fill
+        cell.font = bold
+        cell.border = thin_border
+        cell.alignment = center
+
+    for row_idx, (_, row) in enumerate(data.iterrows(), 4):
+        for col_idx, col_name in enumerate(data.columns, 1):
+            value = row[col_name]
+            if col_idx > 2 and pd.notna(value):
+                try:
+                    value = int(value)
+                except Exception:
+                    pass
+            cell = worksheet.cell(row=row_idx, column=col_idx, value=value)
+            cell.border = thin_border
+            if col_idx > 2:
+                cell.alignment = center
+
+    summary_row = len(data) + 4
+    worksheet.cell(row=summary_row, column=1, value="TOTALS").font = bold
+    for col_idx in range(3, len(data.columns) + 1):
+        col_letter = get_column_letter(col_idx)
+        cell = worksheet.cell(
+            row=summary_row,
+            column=col_idx,
+            value=f"=SUM({col_letter}4:{col_letter}{summary_row-1})"
+        )
+        cell.font = bold
+        cell.border = thin_border
+        cell.alignment = center
+
+    for col_idx, col in enumerate(worksheet.columns, 1):
+        max_len = max((len(str(cell.value)) for cell in col if cell.value), default=0)
+        worksheet.column_dimensions[get_column_letter(col_idx)].width = min(max_len + 2, 24)
+
+
+def format_colorway_classification_sheet(worksheet, data, has_dev_code):
+    header_fill = PatternFill(start_color="E0E0E0", end_color="E0E0E0", fill_type="solid")
+    bold = Font(bold=True)
+    center = Alignment(horizontal="center")
+    thin_border = Border(left=Side(style='thin'), right=Side(style='thin'),
+                         top=Side(style='thin'), bottom=Side(style='thin'))
+
+    worksheet.merge_cells('A1:J1')
+    worksheet['A1'] = "colorway CLASSIFICATION"
+    worksheet['A1'].font = Font(bold=True, size=14)
+    worksheet['A1'].alignment = center
+
+    if has_dev_code:
+        headers = ['Factory', 'Material Indicator', 'Development code', 'LR2', 'FLC', 'SMS', 'CFM', 'Path', 'Origin Stage', 'Last Stage']
+    else:
+        headers = ['Factory', 'Material Indicator', 'Gender_Model', 'LR2', 'FLC', 'SMS', 'CFM', 'Path', 'Origin Stage', 'Last Stage']
+
+    for col_idx, h in enumerate(headers, 1):
+        cell = worksheet.cell(row=3, column=col_idx, value=h)
+        cell.fill = header_fill
+        cell.font = bold
+        cell.border = thin_border
+        cell.alignment = center
+
+    for row_idx, (_, row) in enumerate(data.iterrows(), 4):
+        worksheet.cell(row=row_idx, column=1, value=row['Factory']).border = thin_border
+        worksheet.cell(row=row_idx, column=2, value=row['Material Indicator']).border = thin_border
+        if has_dev_code:
+            worksheet.cell(row=row_idx, column=3, value=row['Development code']).border = thin_border
+        else:
+            worksheet.cell(row=row_idx, column=3, value=row['Gender_Model']).border = thin_border
+        worksheet.cell(row=row_idx, column=4, value=row['LR2']).border = thin_border
+        worksheet.cell(row=row_idx, column=5, value=row['FLC']).border = thin_border
+        worksheet.cell(row=row_idx, column=6, value=row['SMS']).border = thin_border
+        worksheet.cell(row=row_idx, column=7, value=row['CFM']).border = thin_border
+        worksheet.cell(row=row_idx, column=8, value=row['Path']).border = thin_border
+        worksheet.cell(row=row_idx, column=9, value=row['Origin Stage']).border = thin_border
+        worksheet.cell(row=row_idx, column=10, value=row['Last Stage']).border = thin_border
+
+    for col_idx in range(1, 11):
+        worksheet.column_dimensions[get_column_letter(col_idx)].width = 18
+
+
+def format_colorway_detail_sheet(worksheet, data):
+    header_fill = PatternFill(start_color="E0E0E0", end_color="E0E0E0", fill_type="solid")
+    bold = Font(bold=True)
+    center = Alignment(horizontal="center")
+    thin_border = Border(left=Side(style='thin'), right=Side(style='thin'),
+                         top=Side(style='thin'), bottom=Side(style='thin'))
+
+    num_cols = len(data.columns)
+    worksheet.merge_cells(f'A1:{get_column_letter(num_cols)}1')
+    worksheet['A1'] = "FW26 TOOLING ADOPTION - colorway DETAIL"
+    worksheet['A1'].font = Font(bold=True, size=14)
+    worksheet['A1'].alignment = center
+
+    for col_idx, col_name in enumerate(data.columns, 1):
+        cell = worksheet.cell(row=2, column=col_idx, value=col_name)
+        cell.fill = header_fill
+        cell.font = bold
+        cell.border = thin_border
+        cell.alignment = center
+
+    for row_idx, (_, row) in enumerate(data.iterrows(), 3):
+        for col_idx, col_name in enumerate(data.columns, 1):
+            cell = worksheet.cell(row=row_idx, column=col_idx, value=row[col_name])
+            cell.border = thin_border
+            cell.alignment = Alignment(horizontal="left", vertical="top", wrap_text=True)
+
+    for col_idx, col in enumerate(worksheet.columns, 1):
+        max_len = 0
+        for cell in col:
+            if cell.value and isinstance(cell.value, str):
+                max_len = max(max_len, len(cell.value))
+        worksheet.column_dimensions[get_column_letter(col_idx)].width = min(max_len + 2, 50)
+
+    for row_idx in range(3, len(data) + 3):
+        worksheet.row_dimensions[row_idx].height = 60
+
+
+if __name__ == "__main__":
+    input_file = r"C:\Users\Albert\Desktop\Vscode\01. Adoption\rawdata_colorway.xlsx"
+    output_file = r"C:\Users\Albert\Desktop\Vscode\01. Adoption\Output.xlsx"
+    process_excel_data(input_file, output_file)
